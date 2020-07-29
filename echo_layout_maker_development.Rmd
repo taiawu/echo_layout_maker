@@ -1,0 +1,361 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+# This web app is used to convert mother and daughter layouts into echo instruction files
+library(varhandle)
+library(platetools)
+library(tidyverse)
+library(shiny)
+filter <- dplyr::filter
+```
+
+```{r}
+# new daughter layout function
+df_to_layout <- function(df, layout_type) {
+    df_m <-   set_names( df ,  c("type","row",as.numeric( df [1,-c(1,2)]))) %>%
+        . [ -1 , -1] %>%
+        reshape2::melt( . ,id.vars = "row") %>%
+        mutate( . , well = as_vector(map2( . $row,  . $variable, paste0)) ) %>%
+        set_names( . , c("row", "column", layout_type, "well"))
+    df_m
+}
+
+make_layout <- function( filename ) { # from path to raw layout to a final fomatted layout file
+    # read the layout file, and split each layout into an individual
+    layout_list <- data.table::fread( filename, header = TRUE) %>%
+        as_tibble() %>%
+        split( . ,  . $Type)
+    
+    # put into a merge-able form
+    layout <- df_to_layout(layout_list[[1]], names(layout_list)[[1]])[c(1,2,4)] # initialize the list
+    for (i in c(1:length(layout_list))) {
+        layout <- layout %>%
+            mutate("var" =  as_vector(df_to_layout(layout_list[[i]], layout_type = names(layout_list)[[i]])[3] )) %>% # append the column of interest
+            set_names(c(names(layout), names(layout_list)[[i]])) # rename based on the column of interest
+    }
+    layout <- layout %>%
+        unite("condition", c(4:ncol(.)), remove = FALSE) %>% # create a unique column, used to define groups after averaging
+        mutate_if(is.factor, as.character)
+    
+    layout
+}
+```
+
+```{r}
+convert_numerics <- function( vec ) {
+
+  if(all(check.numeric(vec))){
+        # convert the vector to numeric
+        vec <- as.numeric(vec)
+  }
+  vec
+}
+
+round_25 <- function( x ) {
+      if ( x%%25 == 0 ) {
+        return( x )
+      } else {
+        x + 25 - x%%25 
+      }
+}
+
+add_DMSO_dil <- function(df_all, df_mother) {
+  daughter_DMSO <- df_all %>% 
+                        filter(DMSO_vol > 0 )
+  
+  mother_DMSO <- df_mother %>% 
+                filter(compound == "DMSO")
+  
+  n_DMSO_daughter <- daughter_DMSO %>% nrow() # number of DMSO-diluted wells in daugther
+  n_DMSO_mother <- mother_DMSO %>% nrow()
+  
+  mother_reps <- ceiling(n_DMSO_daughter/n_DMSO_mother) 
+  
+  merge_vec <- rep(mother_DMSO$`Source Well`, times = mother_reps) %>%
+               .[c(1:n_DMSO_daughter)]
+  
+  daughter_DMSO_out <- daughter_DMSO %>%
+                        mutate("Source Well" = merge_vec) %>%
+                        mutate(mother_vol = DMSO_vol)
+}
+
+   make_platemap_plot <- function( data, fill_var, alpha_var = NULL ) {
+                                    fill_var <- enquo(fill_var)
+                                    alpha_var <- enquo(alpha_var)
+                          
+                              p <- platetools::plate_map(data = data$well, well = data$well ) %>%
+                                      mutate(well_f = well,
+                                             well = as.character(well)) %>%
+                                       select(-values) %>%
+                                        
+                                    left_join(data, by = "well") %>%
+                                    mutate(well = well_f) %>%
+                                    filter(!!fill_var != "Empty") %>%
+                                
+                                
+                                ggplot( . , aes_string(x = "Column", y = "Row")) +
+                                  geom_point(data = expand.grid(seq(1, 24), seq(1, 16)),
+                                             aes_string(x = "Var1", y = "Var2"),
+                                             color = "grey90", fill = "white", shape = 22, size = 5-2, alpha = 0.1) +
+                                                                  coord_fixed(ratio = (24.5 / 24) / (16.5 / 16), xlim = c(0.5, 24.5)) +
+                                  scale_y_reverse(breaks = seq(1, 16), labels = LETTERS[1:16]) +
+                                  scale_x_continuous(position = "top", breaks = seq(1, 24)) +
+                                  xlab("") +
+                                  ylab("") +
+                                  theme_dark() +
+                                
+                                  geom_point(aes(fill = !!fill_var, alpha = !!alpha_var), colour = "gray20", shape = 22, size = 5) 
+                                
+                                  if(all(check.numeric(data %>% select(!!fill_var) %>% as_vector()))){
+                                    p <- p + 
+                                      scale_fill_viridis_c(begin = 0.8, end = 0)
+                                  } else {
+                                    
+                                    p <- p + 
+                                      scale_fill_viridis_d(begin = 0.8, end = 0)
+                                   }
+                                      
+                                  p
+          
+        }
+```
+
+```{r}
+
+mother <- make_layout("layout_821_for_echo.csv") %>%
+          mutate_all(convert_numerics) %>%
+          select(well, compound, concentration) %>%
+          rename("Source Well" = "well",
+                 "mother_conc" = "concentration")
+
+daughter_raw <- make_layout("sample_daughter.csv") %>%
+                mutate_all(convert_numerics) 
+daughter_raw
+
+all <- daughter_raw %>% 
+            select(well, compound, concentration, volume) %>%
+            mutate_at(c("concentration", "volume"), as.numeric) %>%
+            rename("Destination Well" = "well",
+                   "daughter_conc" = "concentration",
+                   "daughter_final_vol" = "volume") %>%
+          dplyr::filter(daughter_final_vol != 0) %>%
+           left_join( . , mother, by = "compound") %>%
+           mutate(mother_dil = (daughter_conc/mother_conc) * ( daughter_final_vol)) %>%
+                mutate(mother_vol = sapply(X = mother_dil, FUN = round_25)) %>%
+                mutate(DMSO_vol = daughter_final_vol - mother_vol) %>%
+                mutate("Source Plate Name" = rep("Source[1]", times = nrow(.)),
+                       "Destination Plate Name" = rep("Destination[1]", times = nrow(.)),
+                       "Destination Well X Offset"	= rep(NA, times = nrow(.)),
+                       "Destination Well Y Offset"	= rep(NA, times = nrow(.))
+                       ) 
+
+final <-add_DMSO_dil(all, mother) %>%
+        bind_rows(all, . ) %>%
+        mutate(final_daughter_conc = (mother_vol * mother_conc)/daughter_final_vol)
+
+echo_instructions <- final %>%
+                    rename("Transfer Volume" = mother_vol) %>%
+                    select("Source Plate Name",	"Source Well",	"Destination Plate Name",	"Destination Well",	"Transfer Volume",	"Destination Well X Offset",	"Destination Well Y Offset")
+
+# download these
+final
+echo_instructions
+```
+```{r}
+capture.output(sessionInfo()) #, paste0(path_fin, exp_num, as.character(base::Sys.Date()),"_","sessionInfo.txt")
+```
+
+
+```{r}
+   make_platemap_plot <- function( data, fill_var_in, alpha_var_in = "-" ) {
+
+
+        
+    # names(data)
+
+     
+        fill_var <- enquo(fill_var_in)
+        alpha_var <- enquo(alpha_var_in)
+        
+        # if(rlang::as_name(alpha_var_in) %in% names(data)) {alpha_var <- NULL}
+        # if(rlang::as_name(fill_var_in) %in% names(data)) {fill_var <- NULL}
+        # alpha_var <- NULL
+        
+    #     if(rlang::as_name(fill_var) %in% names(data)) {color_var <- enquo(`-`)}
+        
+        data <- data %>%
+              mutate("-" = rep("-", nrow(.)))
+
+                              p <- platetools::plate_map(data = data$well, well = data$well ) %>%
+                                      mutate(well_f = well,
+                                             well = as.character(well)) %>%
+                                       select(-values) %>%
+                                        
+                                    left_join(data, by = "well") %>%
+                                    mutate(well = well_f) %>%
+                                    filter(!!fill_var != "Empty") %>%
+                                
+                                
+                                ggplot( . , aes_string(x = "Column", y = "Row")) +
+                                  geom_point(data = expand.grid(seq(1, 24), seq(1, 16)),
+                                             aes_string(x = "Var1", y = "Var2"),
+                                             color = "grey90", fill = "white", shape = 22, size = 5-2, alpha = 0.1) +
+                                                                  coord_fixed(ratio = (24.5 / 24) / (16.5 / 16), xlim = c(0.5, 24.5)) +
+                                  scale_y_reverse(breaks = seq(1, 16), labels = LETTERS[1:16]) +
+                                  scale_x_continuous(position = "top", breaks = seq(1, 24)) +
+                                  xlab("") +
+                                  ylab("") +
+                                  theme_dark() +
+                                
+                                  geom_point(aes(fill = !!fill_var, alpha = !!alpha_var), colour = "gray20", shape = 22, size = 5) 
+                                
+                                  if(all(check.numeric(data %>% select(!!fill_var) %>% as_vector()))){
+                                    p <- p + 
+                                      scale_fill_viridis_c(begin = 0.8, end = 0)
+                                  } else {
+                                    
+                                    p <- p + 
+                                      scale_fill_viridis_d(begin = 0.8, end = 0)
+                                   }
+                                      
+                                  p
+          
+        }
+
+        
+make_platemap_plot( data = daughter_raw, fill_var_in = "-", alpha_var_in = "-") 
+        
+
+```
+```{r}
+daughter_raw %>%
+  select(-c(row, column, well, condition)) %>% 
+  names() %>% 
+  c("-", .)
+```
+
+
+
+```{r}
+
+# https://www.rdocumentation.org/packages/varhandle/versions/2.0.5/topics/check.numeric
+
+check.numeric <- function(v = NULL, na.rm = FALSE, only.integer = FALSE, exceptions=c(""), ignore.whitespace = TRUE){
+    #----[ checking the input ]----#
+    {
+        # if the only.integer is NOT a single TRUE or FALSE
+        if (!is.logical(only.integer) | length(only.integer) != 1) {
+            # complain
+            stop("The parameter \"only.integer\" should be either TRUE or FALSE.")
+        }
+ 
+        # if user has not defined the vector v
+        if (is.null(v)) {
+          # complain
+            stop("The parameter \"v\" is not defined. It can be character vector, numeric vector, factor vector or logical vector.")
+        # if user has defined but the class is NOT character or factor
+        }else if (!inherits(v, c("character", "factor"))) {
+            # if the class is NOT numeric or integer either
+            if (!inherits(v, c("numeric", "integer", "logical"))) {
+                # complain
+                stop("The parameter \"v\" can only be a character vector, numeric vector, factor vector or logical vector.")
+            # if the class is numeric or integer
+            }else{
+                # if user wants to specifically filter out non-integers, there
+                # is a chance that the vector contains some non-integer numbers
+                # so we should turn the vector to character and run the function
+                if(only.integer){
+                    # convert the vector to character
+                    v <- as.character(v)
+                }else{
+                    # since it is already a number
+                    return(rep(x = TRUE, length(v)))
+                }
+            }
+        }
+ 
+        # if the na.rm is NOT a single TRUE or FALSE
+        if (!is.logical(na.rm) | length(na.rm) != 1) {
+            # complain
+            stop("The parameter \"na.rm\" should be either TRUE or FALSE.")
+        }
+ 
+ 
+ 
+        # if the ignore.whitespace is NOT a single TRUE or FALSE
+        if (!is.logical(ignore.whitespace) | length(ignore.whitespace) != 1) {
+            # complain
+            stop("The parameter \"ignore.whitespace\" should be either TRUE or FALSE.")
+        }
+    }
+ 
+ 
+    #----[ pre-processing ]----#
+    {
+        # convert to character if it is vector
+        if (inherits(v, "factor")) {
+            # convert to character
+            v <- as.character(v)
+        }
+ 
+        # if user wants to ignore NAs
+        if (na.rm) {
+            # if it has some NAs
+            if (any(is.na(v))) {
+                # remove NAs
+                v <- v[-pin.na(v)]
+            }
+        }
+ 
+        # if user wants to ignore leading or tailing white space
+        if (ignore.whitespace) {
+            # substitute whitespaces in the begining and at the ending of each item in v
+            v <- gsub("^\\s+|\\s+$", "", v)
+        }
+    }
+ 
+ 
+    #----[ processing ]----#
+    {
+        # if user wants to only detect integers
+        if (only.integer) {
+            regexp_pattern <- "(^(-|\\+)?\\d+$)|(^(-|\\+)?(\\d*)e(-|\\+)?(\\d+)$)"
+        # if user wants to detect all numbers
+        }else{
+            #regexp_pattern <- "^(-|\\+)?\\d+(\\.?\\d+)?$"
+            regexp_pattern <- "(^(-|\\+)?((\\.?\\d+)|(\\d+\\.\\d+)|(\\d+\\.?))$)|(^(-|\\+)?((\\.?\\d+)|(\\d+\\.\\d+)|(\\d+\\.?))e(-|\\+)?(\\d+)$)"
+        }
+ 
+        # perform the regexp
+        output <- grepl(pattern = regexp_pattern, x = v)
+ 
+        # check for existance of exceptions
+        exception_index <- is.element(v, exceptions)
+        # if there are is exception detected
+        if (any(exception_index)) {
+            # turn their output value to TRUE
+            output[exception_index] <- TRUE
+        }
+ 
+        # if user wants to keep NA
+        if (!na.rm) {
+            # NAs are marked as FALSE by grepl and we replace it with TRUE instead
+            output[is.na(v)] <- TRUE
+        }
+ 
+ 
+        # return the result
+        return(output)
+    }
+}
+```
+
+
+
+
+
+
